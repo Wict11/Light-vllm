@@ -103,14 +103,14 @@ class LLMEngine:
         seqs, is_prefill, num_prefill_tokens, num_decode_tokens = self.scheduler.schedule()
         # 2. 同步执行推理（阻塞等待）
         t1 = perf_counter()
-        print(f"Scheduling time: {(t1 - t0) * 1000:.2f}ms, is_prefill={is_prefill}, num_prefill_tokens={num_prefill_tokens}, num_decode_tokens={num_decode_tokens}, num_seqs={len(seqs)}")
+        # print(f"Scheduling time: {(t1 - t0) * 1000:.2f}ms, is_prefill={is_prefill}, num_prefill_tokens={num_prefill_tokens}, num_decode_tokens={num_decode_tokens}, num_seqs={len(seqs)}")
         token_ids = self.model_runner.call("run", seqs, is_prefill, num_prefill_tokens, num_decode_tokens)
         # 3. 处理结果
         t2 = perf_counter()
-        print(f"Model run time: {(t2 - t1) * 1000:.2f}ms")
+        # print(f"Model run time: {(t2 - t1) * 1000:.2f}ms")
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
         t3 = perf_counter()
-        print(f"Postprocess time: {(t3 - t2) * 1000:.2f}ms")
+        # print(f"Postprocess time: {(t3 - t2) * 1000:.2f}ms")
         
         # 4. 收集输出
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]

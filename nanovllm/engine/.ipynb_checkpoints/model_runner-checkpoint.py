@@ -561,7 +561,7 @@ class ModelRunner:
         # 用于后续模型的前向计算，特别是处理缓存和attention机制时使用
         # set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
          # 额外传递混合批次信息：num_prefill_tokens, num_decode_tokens, context_lens
-        print(f"[DEBUG prepare_prefill] calling set_context with is_prefill=True, num_prefill={num_prefill_tokens}, num_decode={num_decode_tokens}")
+        # print(f"[DEBUG prepare_prefill] calling set_context with is_prefill=True, num_prefill={num_prefill_tokens}, num_decode={num_decode_tokens}")
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables,
                    num_prefill_tokens=num_prefill_tokens, num_decode_tokens=num_decode_tokens)
         ctx = get_context()

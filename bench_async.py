@@ -112,7 +112,7 @@ def example_async():
 
 if __name__ == "__main__":
     # 串行模式
-    # example_sync()
+    example_sync()
     
     # 异步模式
-    example_async()
+    # example_async()
