@@ -12,6 +12,7 @@ class Config:
     max_model_len: int = 1024
     gpu_memory_utilization: float = 0.8
     tensor_parallel_size: int = 1
+    max_num_prefills_per_batch: int = 2
     enforce_eager: bool = False
     hf_config: AutoConfig | None = None
     eos: int = -1

@@ -75,17 +75,33 @@ class Qwen3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q_by_head = q.view(-1, self.num_heads, self.head_dim)
-        q_by_head = self.q_norm(q_by_head)
-        q = q_by_head.view(q.shape)
-        k_by_head = k.view(-1, self.num_kv_heads, self.head_dim)
-        k_by_head = self.k_norm(k_by_head)
-        k = k_by_head.view(k.shape)
-        q, k = self.rotary_emb(positions, q, k)
-        o = self.attn(q, k, v)
-        output = self.o_proj(o)
+        # qkv = self.qkv_proj(hidden_states)
+        # q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # q_by_head = q.view(-1, self.num_heads, self.head_dim)
+        # q_by_head = self.q_norm(q_by_head)
+        # q = q_by_head.view(q.shape)
+        # k_by_head = k.view(-1, self.num_kv_heads, self.head_dim)
+        # k_by_head = self.k_norm(k_by_head)
+        # k = k_by_head.view(k.shape)
+        # q, k = self.rotary_emb(positions, q, k)
+        # o = self.attn(q, k, v)
+        # output = self.o_proj(o)
+        # return output
+        qkv = self.qkv_proj(hidden_states) # 形状是 (bs,seq_len,(num_heads+2*num_kv_heads)*head_dim)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1) # 按最后一维切分为q、k、v
+        # q形状是 (bs,seq_len,num_heads*head_dim)
+        q = q.view(-1, self.num_heads, self.head_dim) # .view将最后维度铺开，形状变为 (bs,seq_len,num_heads,head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
+        
+        q = self.q_norm(q) # 对q和k进行RMS归一化
+        k = self.k_norm(k)
+        q, k = self.rotary_emb(positions, q, k) # 应用RoPE旋转位置编码
+        o = self.attn(q, k, v) # 过Attention
+        # flatten(1, -1) 从第1维到最后展平，(batch_size, seq_len * num_heads * head_dim)
+        # 对应o_proj的输入形状为num_heads*head_dim，在o_proj进行allreduce
+        # 通过o_proj的行并行线性层映射回hidden_size维度
+        output = self.o_proj(o.flatten(1, -1)) 
         return output
 
 

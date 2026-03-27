@@ -104,7 +104,10 @@ class LLMEngine:
         # 2. 同步执行推理（阻塞等待）
         t1 = perf_counter()
         # print(f"Scheduling time: {(t1 - t0) * 1000:.2f}ms, is_prefill={is_prefill}, num_prefill_tokens={num_prefill_tokens}, num_decode_tokens={num_decode_tokens}, num_seqs={len(seqs)}")
+        
+        # 🌟.call("run")和直接run，差的是写不写入shm，但现在单卡应该没啥差别，但是还是有提升
         token_ids = self.model_runner.call("run", seqs, is_prefill, num_prefill_tokens, num_decode_tokens)
+        # token_ids = self.model_runner.run(seqs, is_prefill, num_prefill_tokens, num_decode_tokens)
         # 3. 处理结果
         t2 = perf_counter()
         # print(f"Model run time: {(t2 - t1) * 1000:.2f}ms")
@@ -136,39 +139,69 @@ class LLMEngine:
         outputs = []
         num_tokens = 0
         
-        # -------------------- 步骤1: 处理上一批次 --------------------
+        # -------------------- 步骤1: 先尝试调度下一批次 --------------------
+        # 注意：就算本轮调度不到序列，也必须继续执行“步骤1后处理”，否则会饿死 pending_batch。
+        next_batch = None
+        if not self.scheduler.is_finished():
+            next_batch = self.scheduler.schedule()
+
+        # -------------------- 步骤2: 处理上一批次 --------------------
         if self.pending_batch is not None:
-            seqs, is_prefill = self.pending_batch
+            prev_seqs, prev_is_prefill = self.pending_batch
             
             # 等待推理完成并获取结果
             token_ids = self.model_runner.wait_for_result()
             
             if token_ids is not None:
                 # 处理结果
-                self.scheduler.postprocess(seqs, token_ids, is_prefill)
+                self.scheduler.postprocess(prev_seqs, token_ids, prev_is_prefill)
                 
                 # 收集输出
-                outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+                outputs = [(seq.seq_id, seq.completion_token_ids) for seq in prev_seqs if seq.is_finished]
                 
                 # 计算 token 数量
-                if is_prefill:
-                    num_tokens = sum(seq.prefilled_len for seq in seqs)
+                if prev_is_prefill:
+                    num_tokens = sum(seq.prefilled_len for seq in prev_seqs)
                 else:
-                    num_tokens = -len(seqs)
+                    num_tokens = -len(prev_seqs)
             
             self.pending_batch = None
-        
-        # -------------------- 步骤2: 调度下一批次 --------------------
-        # 检查是否还有任务需要调度
-        if self.scheduler.is_finished():
-            return outputs, num_tokens
-        seqs, is_prefill, num_prefill_tokens, num_decode_tokens = self.scheduler.schedule()
-        
-        # -------------------- 步骤3: 异步启动推理 --------------------
-        self.model_runner.run_async(seqs, is_prefill, num_prefill_tokens, num_decode_tokens)
-        
-        # 记录待处理的批次
-        self.pending_batch = (seqs, is_prefill)
+
+        # -------------------- 步骤3: 异步启动已调度批次 --------------------
+        if next_batch is not None:
+            seqs, is_prefill, num_prefill_tokens, num_decode_tokens = next_batch
+            # 本轮可能暂时无可调度序列（例如等待后处理收尾）
+            if seqs:
+                # 过滤步骤2（postprocess）中刚结束的 stale 序列（eos/abort 路径）
+                # 注意：schedule(N+1) 时 S 还是 RUNNING，postprocess(N) 后才变 FINISHED，
+                # 所以必须在这里而不是在 schedule() 里过滤。
+                active_seqs = [s for s in seqs if not s.is_finished]
+
+                if not active_seqs:
+                    # 全部变 FINISHED，清理 schedule() 刚写入的 pending_batches 条目
+                    if self.scheduler.pending_batches:
+                        self.scheduler.pending_batches.pop()
+                else:
+                    if len(active_seqs) < len(seqs):
+                        # 部分序列被过滤，修正 token 计数并更新 pending_batches 的 seq_ids
+                        batch_chunk_info = self.scheduler.pending_batches[-1].get('chunk_info', {})
+                        active_ids = {s.seq_id for s in active_seqs}
+                        num_prefill_tokens = sum(
+                            v for k, v in batch_chunk_info.items() if k in active_ids
+                        )
+                        num_decode_tokens = sum(
+                            1 for s in active_seqs if s.seq_id not in batch_chunk_info
+                        )
+                        self.scheduler.pending_batches[-1]['seq_ids'] = [
+                            sid for sid in self.scheduler.pending_batches[-1]['seq_ids']
+                            if sid in active_ids
+                        ]
+
+                    # 更新 num_ph_tokens（只对最终真正要跑的序列）
+                    self.scheduler.update_num_ph_tokens_after_schedule(active_seqs)
+                    self.model_runner.run_async(active_seqs, is_prefill, num_prefill_tokens, num_decode_tokens)
+                    # 记录待处理的批次
+                    self.pending_batch = (active_seqs, is_prefill)
         
         return outputs, num_tokens
 

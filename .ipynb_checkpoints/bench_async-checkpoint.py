@@ -73,7 +73,7 @@ def example_sync():
     llm = LLM(
         "/mnt/workspace/nano_vllm/nano-vllm/Qwen/Qwen3-0.6B",
         max_model_len=2048,
-        chunk_prefill_size=512
+        # chunk_prefill_size=512
     )
     try:
         # 先执行一次轻量 warmup，避免首轮冷启动抖动
@@ -96,7 +96,7 @@ def example_async():
     llm = LLM(
         "/mnt/workspace/nano_vllm/nano-vllm/Qwen/Qwen3-0.6B",
         max_model_len=2048,
-        chunk_prefill_size=512,
+        # chunk_prefill_size=512,
         enable_async=True  # ← 启用异步流水线
     )
     try:
@@ -112,7 +112,7 @@ def example_async():
 
 if __name__ == "__main__":
     # 串行模式
-    example_sync()
+    # example_sync()
     
     # 异步模式
-    # example_async()
+    example_async()

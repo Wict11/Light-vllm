@@ -76,6 +76,10 @@ class AsyncScheduler:
         for seq in list(self.running):
             if num_seqs >= self.max_num_seqs:
                 break
+            if seq.is_finished:
+                if seq in self.running:
+                    self.running.remove(seq)
+                continue
             
             # 关键：使用 effective_prefilled_len（包括 pending）
             effective_prefilled = self._get_effective_prefilled_len(seq)
@@ -134,6 +138,11 @@ class AsyncScheduler:
         while self.running and num_seqs < self.max_num_seqs:
             seq = self.running.popleft()
             
+            if seq.is_finished:
+                if seq in self.running:
+                    self.running.remove(seq)
+                continue
+            
             # 检查是否可以 append
             while not self.block_manager.can_append(seq):
                 if self.running:
@@ -154,6 +163,13 @@ class AsyncScheduler:
                     self.running.appendleft(seq)
                     continue
                 
+                # 若“已生成 + 占位”已达到最大输出长度，不再继续调度该序列。
+                # 等待后处理拿到真实 token 后，按既有逻辑进入 finished。
+                projected_completion_tokens = seq.num_completion_tokens + seq.num_ph_tokens
+                if projected_completion_tokens >= seq.max_tokens:
+                    self.running.appendleft(seq)
+                    break
+                
                 # Decode 阶段
                 if self.block_manager.can_append(seq) and \
                    num_batched_tokens + 1 <= self.max_num_batched_tokens:
@@ -171,7 +187,11 @@ class AsyncScheduler:
                     self.running.appendleft(seq)
                     break
 
-        assert scheduled_seqs
+        # assert scheduled_seqs
+        if not scheduled_seqs:
+            # 当前轮可能暂时无可调度序列（例如达到 max_tokens 上限等待后处理收尾），
+            # 返回空批次让上层安全跳过本轮，而不是直接断言退出。
+            return [], False, 0, 0
         self.running.extendleft(reversed(scheduled_seqs))
         
         # 记录 pending 批次信息
@@ -221,50 +241,106 @@ class AsyncScheduler:
         
         CHUNK_SIZE = self.chunk_size
         
+#         if is_prefill:
+#             if len(active_seqs) > 1:
+#                 # 混合批次
+#                 prefill_seq = active_seqs[0]
+                
+#                 # 应用 pending → actual
+#                 if prefill_seq.seq_id in chunk_info:
+#                     chunk_size = chunk_info[prefill_seq.seq_id]
+#                     prefill_seq.prefilled_len += chunk_size
+                
+#                 # 处理 decode 序列
+#                 for seq, token_id in zip(active_seqs[1:], token_ids):
+#                     if seq.aborted:
+#                         continue
+                    
+#                     self.block_manager.may_append(seq)
+#                     seq.append_token(token_id)
+                    
+#                     if (not seq.ignore_eos and token_id == self.eos) or \
+#                        seq.num_completion_tokens == seq.max_tokens:
+#                         seq.status = SequenceStatus.FINISHED
+#                         self.block_manager.deallocate(seq)
+#                         self.running.remove(seq)
+#             else:
+#                 # 纯 prefill
+#                 prefill_seq = active_seqs[0]
+                
+#                 # 应用 pending → actual
+#                 if prefill_seq.seq_id in chunk_info:
+#                     chunk_size = chunk_info[prefill_seq.seq_id]
+#                     prefill_seq.prefilled_len += chunk_size
+#         else:
+#             # 纯 decode
+#             for seq, token_id in zip(active_seqs, token_ids):
+#                 if seq.aborted:
+#                     continue
+                
+#                 seq.append_token(token_id)
+                
+#                 if (not seq.ignore_eos and token_id == self.eos) or \
+#                    seq.num_completion_tokens == seq.max_tokens:
+#                     seq.status = SequenceStatus.FINISHED
+#                     self.block_manager.deallocate(seq)
+#                     self.running.remove(seq)
+        token_ids = token_ids or []
+
         if is_prefill:
-            if len(active_seqs) > 1:
-                # 混合批次
-                prefill_seq = active_seqs[0]
-                
-                # 应用 pending → actual
-                if prefill_seq.seq_id in chunk_info:
-                    chunk_size = chunk_info[prefill_seq.seq_id]
-                    prefill_seq.prefilled_len += chunk_size
-                
-                # 处理 decode 序列
-                for seq, token_id in zip(active_seqs[1:], token_ids):
-                    if seq.aborted:
-                        continue
-                    
-                    self.block_manager.may_append(seq)
-                    seq.append_token(token_id)
-                    
-                    if (not seq.ignore_eos and token_id == self.eos) or \
-                       seq.num_completion_tokens == seq.max_tokens:
-                        seq.status = SequenceStatus.FINISHED
-                        self.block_manager.deallocate(seq)
+            # 1. 更新chunked prefill进度（pending -> actual）
+            prefill_seqs = [seq for seq in active_seqs if seq.seq_id in chunk_info]
+            decode_seqs = [seq for seq in active_seqs if seq.seq_id not in chunk_info]
+
+            for prefill_seq in prefill_seqs:
+                chunk_size = chunk_info[prefill_seq.seq_id]
+                prefill_seq.prefilled_len += chunk_size
+
+            # 2. 需要写入真实 token 的序列：
+            #   1) 原本 decode 序列
+            #   2) 本轮 prefill 后已完成（不再处于 chunked prefill）的序列
+            token_target_seqs: list[Sequence] = []
+            token_target_seqs.extend(decode_seqs)
+            for prefill_seq in prefill_seqs:
+                remain = prefill_seq.num_prompt_tokens - prefill_seq.num_cached_tokens - prefill_seq.prefilled_len
+                if remain <= 0:
+                    token_target_seqs.append(prefill_seq)
+
+            # 3. 遍历需要添加新token的序列
+            for seq, token_id in zip(token_target_seqs, token_ids):
+                if seq.aborted:
+                    continue
+
+                self.block_manager.may_append(seq)
+                seq.append_token(token_id)
+
+                # 更新 num_ph_tokens
+                if hasattr(seq, "num_ph_tokens"):
+                    seq.num_ph_tokens = max(0, seq.num_ph_tokens - 1)
+
+                if (not seq.ignore_eos and token_id == self.eos) or \
+                   seq.num_completion_tokens == seq.max_tokens:
+                    seq.status = SequenceStatus.FINISHED
+                    self.block_manager.deallocate(seq)
+                    if seq in self.running:
                         self.running.remove(seq)
-            else:
-                # 纯 prefill
-                prefill_seq = active_seqs[0]
-                
-                # 应用 pending → actual
-                if prefill_seq.seq_id in chunk_info:
-                    chunk_size = chunk_info[prefill_seq.seq_id]
-                    prefill_seq.prefilled_len += chunk_size
         else:
             # 纯 decode
             for seq, token_id in zip(active_seqs, token_ids):
                 if seq.aborted:
                     continue
-                
+
                 seq.append_token(token_id)
-                
+                # 更新num_ph_tokens
+                if hasattr(seq, "num_ph_tokens"):
+                    seq.num_ph_tokens = max(0, seq.num_ph_tokens - 1)
+
                 if (not seq.ignore_eos and token_id == self.eos) or \
                    seq.num_completion_tokens == seq.max_tokens:
                     seq.status = SequenceStatus.FINISHED
                     self.block_manager.deallocate(seq)
-                    self.running.remove(seq)
+                    if seq in self.running:
+                        self.running.remove(seq)
 
     def preempt(self, seq: Sequence):
         """抢占序列"""
@@ -306,6 +382,44 @@ class AsyncScheduler:
         
         return actual_prefilled + pending_prefilled
 
+    def update_num_ph_tokens_after_schedule(self, scheduled_seqs: list[Sequence]):
+        """
+        在 schedule() 之后更新本轮调度序列的 num_ph_tokens。
+
+        规则：
+        1) decode 序列：num_ph_tokens += 1
+        2) prefill 序列：仅当本轮后 prefill 已完成（remain <= 0）时，num_ph_tokens += 1
+
+        注意：
+        - 这里不更新 prefilled_len。
+        - prefill 完成判断通过 _get_effective_prefilled_len() 获取。
+        """
+        if not scheduled_seqs or not self.pending_batches:
+            return
+
+        # schedule() 刚写入的当前批次信息
+        latest_batch_info = self.pending_batches[-1]
+        chunk_info = latest_batch_info.get("chunk_info", {})
+
+        for seq in scheduled_seqs:
+            # 确保属性存在
+            if not hasattr(seq, "num_ph_tokens"):
+                seq.num_ph_tokens = 0
+
+            # # decode 序列（不在 chunk_info 里）
+            # if seq.seq_id not in chunk_info:
+            #     seq.num_ph_tokens += 1
+            #     # continue
+            # 仅 decode 序列（不在 chunk_info 里）增加占位计数
+            if seq.seq_id not in chunk_info:
+                seq.num_ph_tokens += 1
+
+            # prefill 序列：本轮后若 prefill 完成，则该序列会对应一个待回填 token
+            # effective_prefilled = self._get_effective_prefilled_len(seq)
+            # remain = seq.num_prompt_tokens - seq.num_cached_tokens - effective_prefilled
+            # if remain <= 0:
+            #     seq.num_ph_tokens += 1
+    
     def get_stats(self) -> dict:
         """获取调度器统计信息"""
         return {

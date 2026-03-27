@@ -129,14 +129,14 @@ class BlockManager:
         block_table = seq.block_table
         last_block = self.blocks[block_table[-1]]
         if len(seq) % self.block_size == 1:
-            assert last_block.hash != -1
+            # assert last_block.hash != -1
             # 需要分配一个新的block；若前一block尚未写入hash（被抢占重新分配等场景），补写hash
-            # if last_block.hash == -1:
-            #     token_ids = seq.block(seq.num_blocks-1)
-            #     prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
-            #     h = self.compute_hash(token_ids, prefix)
-            #     last_block.update(h, token_ids)
-            #     self.hash_to_block_id[h] = last_block.block_id
+            if last_block.hash == -1:
+                token_ids = seq.block(seq.num_blocks-1)
+                prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+                h = self.compute_hash(token_ids, prefix)
+                last_block.update(h, token_ids)
+                self.hash_to_block_id[h] = last_block.block_id
             block_id = self.free_block_ids[0]
             self._allocate_block(block_id)
             block_table.append(block_id)

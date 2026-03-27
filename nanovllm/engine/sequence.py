@@ -29,6 +29,7 @@ class Sequence:
         self.ignore_eos = sampling_params.ignore_eos
         self.prefilled_len = 0
         self.aborted = False  # 标记序列是否被取消（用于异步调度）
+        self.num_ph_tokens = 0
 
     def __len__(self):
         return self.num_tokens

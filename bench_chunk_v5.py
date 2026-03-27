@@ -53,6 +53,7 @@ def benchmark_single_config(
     ttft_data = {}         # seq_id -> first token time (ms)
     ttft_data = {}         # seq_id -> first token time (ms)
     request_info = {}      # seq_id -> {type, injected_at_step, prompt_len}
+    request_submit_time = {}  # seq_id -> 请求提交时的相对时间 (秒)
     last_token_time = {}   # seq_id -> (time_sec, token_count)
     step_logs = []         # 每步的调度信息
     
@@ -62,11 +63,11 @@ def benchmark_single_config(
     num_bg_started = 0
     num_long_started = 0
     
-    def record_step_info(step_num, current_time):
+    def record_step_info(step_num, step_duration):
         """记录当前步骤的调度信息"""
         step_info = {
             'step': step_num,
-            'time': current_time,
+            'duration_ms': step_duration * 1000,
             'running': [],
             'waiting': []
         }
@@ -94,11 +95,12 @@ def benchmark_single_config(
         step_logs.append(step_info)
     
     # === 阶段 1: 启动背景请求并运行到 step 10 ===
+    benchmark_start = time.perf_counter()
     for i, prompt in enumerate(background_prompts):
         llm.add_request(prompt, sampling_params)
         num_bg_started += 1
-    
-    benchmark_start = time.perf_counter()
+    # 背景请求的提交时间：记录添加完成后的时间
+    bg_submit_time = time.perf_counter() - benchmark_start
     step_count = 0
     INJECT_AT_STEP = 10
     
@@ -114,9 +116,13 @@ def benchmark_single_config(
                 if step_count <= INJECT_AT_STEP:
                     bg_seq_ids.add(seq_id)
                     req_type = "background"
+                    # 背景请求在 benchmark 开始时提交
+                    request_submit_time[seq_id] = bg_submit_time
                 else:
                     long_seq_ids.add(seq_id)
                     req_type = "long"
+                    # 长请求的提交时间在插入时已记录
+                    request_submit_time[seq_id] = long_submit_time
                 
                 request_timelines[seq_id] = {
                     "prompt_len": len(seq.prompt_token_ids),
@@ -136,7 +142,9 @@ def benchmark_single_config(
             token_count = len(seq.completion_token_ids)
             request_timelines[seq_id]["timeline"].append((relative_time_ms, token_count))
             if token_count > 0 and seq_id not in ttft_data:
-                ttft_data[seq_id] = relative_time_ms
+                # TTFT = 第一个 token 产生时间 - 请求提交时间
+                submit_time_ms = request_submit_time.get(seq_id, 0) * 1000
+                ttft_data[seq_id] = relative_time_ms - submit_time_ms
             
             # 计算 TBT
             if last_token_time[seq_id] is None:
@@ -156,12 +164,14 @@ def benchmark_single_config(
         outputs, _ = llm.step()
         step_end = time.perf_counter()
         current_time = step_end - benchmark_start
+        step_duration = step_end - step_start
         
         # 记录调度信息和所有请求状态
-        record_step_info(step_count, current_time)
+        record_step_info(step_count, step_duration)
         update_all_requests(current_time)
     
     # === 阶段 2: 插入长请求 ===
+    long_submit_time = time.perf_counter() - benchmark_start  # 记录长请求提交时间
     for i, prompt in enumerate(long_prompts):
         llm.add_request(prompt, sampling_params)
         num_long_started += 1
@@ -174,9 +184,10 @@ def benchmark_single_config(
         outputs, _ = llm.step()
         step_end = time.perf_counter()
         current_time = step_end - benchmark_start
+        step_duration = step_end - step_start
         
         # 记录调度信息和所有请求状态
-        record_step_info(step_count, current_time)
+        record_step_info(step_count, step_duration)
         update_all_requests(current_time)
     
     total_time = time.perf_counter() - benchmark_start
@@ -213,7 +224,7 @@ def benchmark_single_config(
     print(f"{'='*80}")
     
     for log in step_logs[max(0, INJECT_AT_STEP-3):min(len(step_logs), INJECT_AT_STEP+10)]:
-        print(f"\nStep {log['step']} @ {log['time']:.3f}s:")
+        print(f"\nStep {log['step']} (Duration: {log['duration_ms']:.2f}ms):")
         if log['running']:
             print(f"  Running ({len(log['running'])}):")
             for seq_info in log['running']:
@@ -313,14 +324,14 @@ def main(model_path: str, chunk_size: int, save_results: str = None, save_plot: 
     
     # 2 个背景请求：短 prompt (~20 tokens)
     background_prompts = [
-        [random.randint(0, vocab_size - 1) for _ in range(random.randint(15, 25))]
+        [random.randint(0, vocab_size - 1) for _ in range(random.randint(980, 1020))]
         for _ in range(5)
     ]
     
     # 1 个长请求：长 prompt (~1000 tokens)
     long_prompts = [
         [random.randint(0, vocab_size - 1) for _ in range(random.randint(980, 1020))]
-        for _ in range(5)
+        for _ in range(10)
     ]
     
     llm = LLM(model_path, max_model_len=8192, chunk_prefill_size=chunk_size)
@@ -357,10 +368,9 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Token generation timeline benchmark")
     parser.add_argument("--model", type=str, 
-                       # default="/mnt/workspace/nano_vllm/nano-vllm/Qwen/Qwen3-0.6B",
-                        default="/mnt/workspace/vllm/Qwen/Qwen3-4B-Instruct-2507",
+                       default="/mnt/workspace/nano_vllm/nano-vllm/Qwen/Qwen3-0.6B",
                        help="Path to model")
-    parser.add_argument("--chunk-size", type=int, default=1024, 
+    parser.add_argument("--chunk-size", type=int, default=2000, 
                        help="Chunk size for prefill (999999 to disable)")
     parser.add_argument("--save-results", type=str, default=None, 
                        help="Save results to JSON file")

@@ -171,63 +171,6 @@ class ModelRunner:
         ).cuda(non_blocking=True)
         return block_tables
 
-    # def prepare_prefill(self, seqs: list[Sequence]):
-    #     input_ids = []
-    #     positions = []
-    #     cu_seqlens_q = [0]
-    #     cu_seqlens_k = [0]
-    #     max_seqlen_q = 0
-    #     max_seqlen_k = 0
-    #     slot_mapping = []
-    #     block_tables = None
-    #     for seq in seqs:
-    #         seqlen = len(seq)
-    #         input_ids.extend(seq[seq.num_cached_tokens :])
-    #         positions.extend(list(range(seq.num_cached_tokens, seqlen)))
-    #         seqlen_q = seqlen - seq.num_cached_tokens
-    #         seqlen_k = seqlen
-    #         cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
-    #         cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
-    #         max_seqlen_q = max(seqlen_q, max_seqlen_q)
-    #         max_seqlen_k = max(seqlen_k, max_seqlen_k)
-    #         if not seq.block_table:
-    #             continue
-    #         for i in range(seq.num_cached_blocks, seq.num_blocks):
-    #             start = seq.block_table[i] * self.block_size
-    #             if i != seq.num_blocks - 1:
-    #                 end = start + self.block_size
-    #             else:
-    #                 end = start + seq.last_block_num_tokens
-    #             slot_mapping.extend(list(range(start, end)))
-    #     if cu_seqlens_k[-1] > cu_seqlens_q[-1]:  # prefix cache
-    #         block_tables = self.prepare_block_tables(seqs)
-    #     input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(
-    #         non_blocking=True
-    #     )
-    #     positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(
-    #         non_blocking=True
-    #     )
-    #     cu_seqlens_q = torch.tensor(
-    #         cu_seqlens_q, dtype=torch.int32, pin_memory=True
-    #     ).cuda(non_blocking=True)
-    #     cu_seqlens_k = torch.tensor(
-    #         cu_seqlens_k, dtype=torch.int32, pin_memory=True
-    #     ).cuda(non_blocking=True)
-    #     slot_mapping = torch.tensor(
-    #         slot_mapping, dtype=torch.int32, pin_memory=True
-    #     ).cuda(non_blocking=True)
-    #     set_context(
-    #         True,
-    #         cu_seqlens_q,
-    #         cu_seqlens_k,
-    #         max_seqlen_q,
-    #         max_seqlen_k,
-    #         slot_mapping,
-    #         None,
-    #         block_tables,
-    #     )
-    #     return input_ids, positions
-
     def prepare_decode(self, seqs: list[Sequence]):
         input_ids = []
         positions = []
@@ -261,47 +204,52 @@ class ModelRunner:
         )
         return input_ids, positions
 
-    def prepare_sample(self, seqs: list[Sequence], is_prefill:bool = False, num_logits:int = None):
+    # def prepare_sample(self, seqs: list[Sequence], is_prefill: bool = False, num_logits: int = None):
+    #     '''
+    #     为采样准备 temperature 张量。
+    #     混合批次中 prefill 序列的 logits 已被剥离，只需为 decode 序列准备 temperature。
+    #     通过跳过所有 prompt_remaining > 0 的序列（即 prefill 序列）来实现。
+    #     '''
+    #     temperatures = []
+    #     if is_prefill and num_logits is not None and num_logits < len(seqs):
+    #         # 混合批次：跳过所有 prefill 序列，只收集 decode 序列的 temperature
+    #         for seq in seqs:
+    #             prompt_remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_len
+    #             if prompt_remaining <= 0:
+    #                 temperatures.append(seq.temperature)
+    #     else:
+    #         # 纯 prefill（warmup）或纯 decode：为所有序列准备 temperature
+    #         for seq in seqs:
+    #             temperatures.append(seq.temperature)
+    #     # 截断到实际 logits 数量（处理 warmup 等 num_logits != len(seqs) 的情况）
+    #     if num_logits is not None and len(temperatures) > num_logits:
+    #         temperatures = temperatures[:num_logits]
+    #     temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+    #     return temperatures
+    def prepare_sample(self, seqs: list[Sequence], is_prefill: bool = False, num_logits: int = None):
+        '''
+        为采样准备 temperature 张量。
+        混合批次中，需要为 decode 序列以及刚好完成 prefill 的序列准备 temperature。
+        '''
+        CHUNK_SIZE = self.chunk_size
         temperatures = []
-        # ---------------- 添加chunked prefill逻辑 ------------------
-        # 根据实际生成的 logits 数量来准备 temperature
-        if num_logits is not None:
-            # 使用实际的 logits 数量来决定需要多少个 temperature
-            # 这样可以处理 warmup 等场景下序列数量和 logits 数量不匹配的情况
-            if is_prefill and len(seqs) > 1 and num_logits < len(seqs):
-                # 混合批次：第一个是 prefill，其余是 decode
-                # num_logits < len(seqs) 说明第一个序列没有生成 logit
-                start_idx = 1
-                end_idx = num_logits + 1
-            else:
-                # 纯 prefill 或纯 decode，取前 num_logits 个序列
-                start_idx = 0
-                end_idx = num_logits
-            
-            for seq in seqs[start_idx:end_idx]:
-                temperatures.append(seq.temperature)
+        if is_prefill:
+            # 混合批次：跳过还需要继续 prefill 的序列，只收集本轮产出 token 的序列
+            for seq in seqs:
+                prompt_remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_len
+                if prompt_remaining <= CHUNK_SIZE:
+                    temperatures.append(seq.temperature)
         else:
-            # 旧逻辑，兼容性保留
-            is_mixed_batch = False
-            if is_prefill and len(seqs) > 1:
-                first_seq = seqs[0]
-                remaining = len(first_seq) - first_seq.num_cached_tokens - first_seq.prefilled_len
-                if remaining > 0:
-                    is_mixed_batch = all(
-                        len(s) - s.num_cached_tokens - s.prefilled_len <= 0
-                        for s in seqs[1:]
-                    )
-            
-            start_idx = 1 if is_mixed_batch else 0
-            for seq in seqs[start_idx:]:
+            # 纯 decode：为所有序列准备 temperature
+            for seq in seqs:
                 temperatures.append(seq.temperature)
-        # ---------------- 添加chunked prefill逻辑 ------------------
-        # for seq in seqs:
-        #     temperatures.append(seq.temperature)
-        temperatures = torch.tensor(
-            temperatures, dtype=torch.float32, pin_memory=True
-        ).cuda(non_blocking=True)
+                
+        # 截断到实际 logits 数量（处理 warmup 等 num_logits != len(seqs) 的情况）
+        if num_logits is not None and len(temperatures) > num_logits:
+            temperatures = temperatures[:num_logits]
+        temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
+    
 
     @torch.inference_mode()
     def run_model(
@@ -328,50 +276,108 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    # def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+#     def run(self, seqs: list[Sequence], is_prefill: bool, num_prefill_tokens: int = 0, num_decode_tokens: int = 0) -> list[int]:
+#         # input_ids, positions = (
+#         #     self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
+#         # )
+#         t0 = perf_counter()
+#         if is_prefill:
+#             input_ids, positions = self.prepare_prefill(seqs, num_prefill_tokens, num_decode_tokens)
+#         else:
+#             input_ids, positions = self.prepare_decode(seqs)
+                
+#         # DEBUG: 打印输入信息
+#         if self.rank == 0 and is_prefill and len(seqs) > 1:
+#             # print(f"\n[DEBUG run] Mixed batch: {len(seqs)} seqs")
+#             for i, seq in enumerate(seqs):
+#                 remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_len
+#                 # print(f"  Seq[{i}] id={seq.seq_id}: remaining={remaining}, total_tokens={len(seq)}")
+#             # print(f"  input_ids.shape: {input_ids.shape}")
+#         t1 = perf_counter()
+#         # print(f"prepare_prefill/decode time: {(t1 - t0) * 1000:.2f}ms")
+#         logits = self.run_model(input_ids, positions, is_prefill)
+#         t2 = perf_counter()
+#         # print(f"run model time: {(t2 - t1) * 1000:.2f}ms")
+
+
+#         if is_prefill:
+#             # 统计 prefill 序列数量（prompt_remaining > 0 的序列）
+#             num_prefill_seqs = 0
+#             for seq in seqs:
+#                 prompt_remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_len
+#                 if prompt_remaining > 0:
+#                     num_prefill_seqs += 1
+#             # 剥离 prefill 序列的 logits（每个 prefill 序列在 logits 中占 1 行）
+#             if num_prefill_seqs > 0 and num_prefill_seqs < len(seqs):
+#                 logits = logits[num_prefill_seqs:]
+                
+#         num_logits = logits.size(0) if self.rank == 0 else None
+#         temperatures = self.prepare_sample(seqs, is_prefill, num_logits) if self.rank == 0 else None
+#         token_ids = (
+#             self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+#         )
+#         t3 = perf_counter()
+#         # print(f"sample time: {(t3 - t2) * 1000:.2f}ms")
+#         reset_context()
+#         return token_ids
     def run(self, seqs: list[Sequence], is_prefill: bool, num_prefill_tokens: int = 0, num_decode_tokens: int = 0) -> list[int]:
-        # input_ids, positions = (
-        #     self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        # )
-        t0 = perf_counter()
+        # 根据prefill或decode调用不同的函数获取input_ids和positions
         if is_prefill:
             input_ids, positions = self.prepare_prefill(seqs, num_prefill_tokens, num_decode_tokens)
         else:
             input_ids, positions = self.prepare_decode(seqs)
-                
-        # DEBUG: 打印输入信息
-        if self.rank == 0 and is_prefill and len(seqs) > 1:
-            # print(f"\n[DEBUG run] Mixed batch: {len(seqs)} seqs")
-            for i, seq in enumerate(seqs):
-                remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_len
-                # print(f"  Seq[{i}] id={seq.seq_id}: remaining={remaining}, total_tokens={len(seq)}")
-            # print(f"  input_ids.shape: {input_ids.shape}")
-        t1 = perf_counter()
-        # print(f"prepare_prefill/decode time: {(t1 - t0) * 1000:.2f}ms")
+
         logits = self.run_model(input_ids, positions, is_prefill)
-        t2 = perf_counter()
-        # print(f"run model time: {(t2 - t1) * 1000:.2f}ms")
 
-
-        if is_prefill and len(seqs) > 1:
-            # CHUNK_SIZE = 512
+        # 混合批次（prefill + decode）：保留刚好完成 prefill 以及纯 decode 的序列的 logits
+#         if is_prefill:
+#             CHUNK_SIZE = self.chunk_size
+#             keep_indices = []
+#             for i, seq in enumerate(seqs):
+#                 prompt_remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_len
+#                 # 只有不仅是prefill而且还没完成的请求才丢弃 logit
+#                 if prompt_remaining <= CHUNK_SIZE:
+#                     keep_indices.append(i)
+                    
+#             if len(keep_indices) < len(seqs):
+#                 keep_indices_tensor = torch.tensor(keep_indices, dtype=torch.long, device=logits.device)
+#                 logits = logits[keep_indices_tensor]
+        if is_prefill:
             CHUNK_SIZE = self.chunk_size
-            # 检查第一个序列是否有 prefill chunk
-            prefill_seq = seqs[0]
-            prompt_remaining = prefill_seq.num_prompt_tokens - prefill_seq.num_cached_tokens - prefill_seq.prefilled_len
-            # print(f"[DEBUG strip] prompt_remaining={prompt_remaining}")
-            if prompt_remaining > 0:
-                # 第一个序列是 prefill，丢弃第一行 logits（对应prefill序列）
-                # print(f"[DEBUG strip] original logits.shape={logits.shape}, removing first sequence logits")
-                logits = logits[1:]  # 移除第一行（prefill序列的logits）
+            keep_indices = []
+            current_offset = 0
+            for i, seq in enumerate(seqs):
+                prompt_remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_len
+                if prompt_remaining > 0:
+                    seqlen_q = min(CHUNK_SIZE, prompt_remaining)
+                else:
+                    seqlen_q = 1
                 
+                # 当前序列在 flat logits 张量中的最后一个 token 的索引
+                last_token_idx = current_offset + seqlen_q - 1
+                current_offset += seqlen_q
+
+                # 只有不仅是prefill而且还没完成的请求才丢弃 logit
+                if prompt_remaining <= CHUNK_SIZE:
+                    keep_indices.append(last_token_idx)
+                    
+            if keep_indices:
+                keep_indices_tensor = torch.tensor(keep_indices, dtype=torch.long, device=logits.device)
+                logits = logits[keep_indices_tensor]
+            else:
+                logits = logits[0:0]
+
+        # 根据实际生成的 logits 数量来准备 temperature
         num_logits = logits.size(0) if self.rank == 0 else None
         temperatures = self.prepare_sample(seqs, is_prefill, num_logits) if self.rank == 0 else None
-        token_ids = (
-            self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
-        )
-        t3 = perf_counter()
-        # print(f"sample time: {(t3 - t2) * 1000:.2f}ms")
+
+        if self.rank == 0:
+            if num_logits == 0:
+                token_ids = []
+            else:
+                token_ids = self.sampler(logits, temperatures).tolist()
+        else:
+            token_ids = None
         reset_context()
         return token_ids
 
@@ -416,7 +422,7 @@ class ModelRunner:
             block_tables=block_tables,
             outputs=outputs,
         )
-    # def prepare_prefill(self, seqs: list[Sequence
+    
     def prepare_prefill(self, seqs: list[Sequence], num_prefill_tokens: int = 0, num_decode_tokens: int = 0):
         '''
         支持混合批次：分别处理 prefill 和 decode 序列
@@ -437,22 +443,7 @@ class ModelRunner:
         # for seq in seqs:
         for i, seq in enumerate(seqs):
             seqlen = len(seq)
-            # 存储未缓存的token_ids和对应的位置
-            # ---------------- 原始代码 ------------------
-            # input_ids.extend(seq[seq.num_cached_tokens:])
-            # positions.extend(list(range(seq.num_cached_tokens, seqlen)))
-
-            # q序列的长度是未缓存的token数，为什么能减去缓存了的token数？
-            # 因为cached token不需要重新计算attention，只需要计算新生成的token对cached token的attention
-            # 而k序列的长度是整个序列长度，因为k需要包含所有token用于后续的attention计算
-            # seqlen_q = seqlen - seq.num_cached_tokens
-            # seqlen_k = seqlen
-            # ---------------- 原始代码 ------------------
-
-            # ---------------- 修改chunked prefill逻辑 ------------------
-
-           
-            
+         
             # seqlen_q = min(CHUNK_SIZE, seqlen - start_pos)  # q序列长度为一个chunk大小
             # seqlen_k = end_pos # k序列长度只包含已经prefill的token
             # remaining_prefill = seqlen - seq.num_cached_tokens - seq.prefilled_len
@@ -514,14 +505,6 @@ class ModelRunner:
                         # 添加token到blcok_table的映射位置
                         slot = seq.block_table[block_idx] * self.block_size + block_offset
                         slot_mapping.append(slot)
-            # for i in range(seq.num_cached_blocks, seq.num_blocks):
-            #     # 计算每个块的开始和结束位置，用于slot_mapping
-            #     start = seq.block_table[i] * self.block_size
-            #     if i != seq.num_blocks - 1:
-            #         end = start + self.block_size
-            #     else:
-            #         end = start + seq.last_block_num_tokens 
-            #     slot_mapping.extend(list(range(start, end)))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             # 说明存在缓存的token，将块表对齐，可以根据块表快速定位缓存位置
             # 这个对齐和同一批次内不同序列之间填充对齐序列长度是不一样的
@@ -538,18 +521,7 @@ class ModelRunner:
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if context_lens else None
-        
-        # 额外打印当前批次涉及的KV占用，辅助定位是否接近KV块上限
-        # all_block_ids = [bid for seq in seqs for bid in seq.block_table]
-        # max_block_id = max(all_block_ids) if all_block_ids else -1
-        # unique_blocks = len(set(all_block_ids))
-        # est_tokens_in_cache = unique_blocks * self.block_size
-        # print(
-        #     f"[KVCache batch] seqs={len(seqs)}, unique_blocks={unique_blocks}, "
-        #     f"max_block_id={max_block_id}, est_cached_tokens≈{est_tokens_in_cache}, "
-        #     f"block_capacity={self.config.num_kvcache_blocks * self.block_size}"
-        # )
-        
+
         # 如果传入的 num_prefill_tokens 和 num_decode_tokens 都是 0（如 warmup 时），
         # 则根据实际的 cu_seqlens_q 推断真实的 token 数量
         if num_prefill_tokens == 0 and num_decode_tokens == 0:

@@ -75,28 +75,33 @@ class AsyncModelRunner:
         Returns:
             None (立即返回，不等待结果)
         """
+        
+        # ======================= CUDA Stream版本 ========================= #
         # call函数，会给子进程写入shm，通知其他进程同步启动run()函数，所以必须要，
         # 但call函数又会导致返回值阻塞，无法真正异步，所以额外开一个thread跑推理进程
 
-        # if not self.use_async or self.rank != 0:
-        #     # 非主进程或未启用异步，直接同步执行
-        #     result = self.model_runner.call("run", seqs, is_prefill, num_prefill_tokens, num_decode_tokens)
-        #     self.pending_results = [(result, None, None)]
-        #     return
+#         if not self.use_async or self.rank != 0:
+#             # 非主进程或未启用异步，直接同步执行
+#             result = self.model_runner.call("run", seqs, is_prefill, num_prefill_tokens, num_decode_tokens)
+#             self.pending_results = [(result, None, None)]
+#             return
         
-        # # 在独立 stream 中异步执行
-        # with torch.cuda.stream(self.inference_stream):
-        #     # 执行推理
-        #     result = self.model_runner.call("run", seqs, is_prefill, num_prefill_tokens, num_decode_tokens)
+#         # 在独立 stream 中异步执行
+#         with torch.cuda.stream(self.inference_stream):
+#             # 执行推理
+#             result = self.model_runner.run(seqs, is_prefill, num_prefill_tokens, num_decode_tokens)
             
-        #     # 创建同步事件
-        #     event = torch.cuda.Event()
-        #     event.record(self.inference_stream)
+#             # 创建同步事件
+#             event = torch.cuda.Event()
+#             event.record(self.inference_stream)
             
-        #     # 记录 pending 结果
-        #     self.pending_results.append((result, event, (seqs, is_prefill)))
+#             # 记录 pending 结果
+#             self.pending_results.append((result, event, (seqs, is_prefill)))
         
-        # 立即返回，不等待
+#         # 立即返回，不等待
+        
+        
+        # ================== Thread版本 =====================#
         self._result = None
         self._exception = None
         self._thread = threading.Thread(
@@ -111,6 +116,18 @@ class AsyncModelRunner:
         """
         阻塞等待后台线程完成（流水线唯一同步点），返回 token_ids。
         """
+        # ======================= CUDA Stream版本 ========================= #
+#         if not self.pending_results:
+#             return None
+        
+#         result, event, args = self.pending_results.pop(0)
+        
+#         # 同步等待完成
+#         if event is not None:
+#             event.synchronize()
+        
+#         return result
+        # ================== Thread版本 =====================#
         if self._thread is None:
             return None
         self._thread.join()   # ⭐ 唯一阻塞点，等待后台进程结束
