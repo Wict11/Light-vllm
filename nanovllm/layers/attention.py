@@ -19,11 +19,13 @@ def store_kvcache_kernel(
     D: tl.constexpr,
 ):
     idx = tl.program_id(0)
+    slot = tl.load(slot_mapping_ptr + idx)
+    if slot == -1:
+        return
     key_offsets = idx * key_stride + tl.arange(0, D)
     value_offsets = idx * value_stride + tl.arange(0, D)
     key = tl.load(key_ptr + key_offsets)
     value = tl.load(value_ptr + value_offsets)
-    slot = tl.load(slot_mapping_ptr + idx)
     cache_offsets = slot * D + tl.arange(0, D)
     tl.store(k_cache_ptr + cache_offsets, key)
     tl.store(v_cache_ptr + cache_offsets, value)
@@ -194,7 +196,7 @@ class Attention(nn.Module):
             )
             
             if is_mixed:
-                use_unified_varlen = False  # 开关：True 表示把 decode 当作长度为 1 的 prefill 统一处理，False 保留原串行逻辑
+                use_unified_varlen = True  # 开关：True 表示把 decode 当作长度为 1 的 prefill 统一处理，False 保留原串行逻辑
 
                 if use_unified_varlen:
                     # 统一使用 flash_attn_varlen_func 处理整个混合批次
@@ -213,7 +215,6 @@ class Attention(nn.Module):
                 else:
                     # 混合批次：分别处理 prefill 和 decode，然后合并
                     num_prefill = context.num_prefill_tokens
-                    num_decode = context.num_decode_tokens
 
                     # 计算有多少个 prefill 序列（cu_seqlens_q 前缀内的序列数）
                     num_prefill_seqs = 0
@@ -276,19 +277,36 @@ class Attention(nn.Module):
                     )
 
                     # 处理 decode 部分 - 使用 kvcache
-                    # 正确切分 decode 序列的 context_lens 和 block_table
-                    decode_context_lens = context.context_lens[num_prefill_seqs:] if context.context_lens is not None else None
-                    decode_block_tables = context.block_tables[num_prefill_seqs:] if context.block_tables is not None else None
+                    # 按 q_decode 的真实 batch 大小对齐 decode 的辅助张量，避免 shape 不匹配
+                    num_decode = int(q_decode.size(0))
+                    if num_decode > 0:
+                        total_seqs = int(context.cu_seqlens_q.numel() - 1) if context.cu_seqlens_q is not None else num_prefill_seqs + num_decode
+                        decode_start = max(0, total_seqs - num_decode)
 
-                    o_decode = flash_attn_with_kvcache(
-                        q_decode.unsqueeze(1),  # (num_decode, 1, num_heads, head_dim)
-                        k_cache,
-                        v_cache,
-                        cache_seqlens=decode_context_lens,
-                        block_table=decode_block_tables,
-                        softmax_scale=self.scale,
-                        causal=True
-                    ).squeeze(1)
+                        decode_context_lens = (
+                            context.context_lens[decode_start:decode_start + num_decode]
+                            if context.context_lens is not None else None
+                        )
+                        decode_block_tables = (
+                            context.block_tables[decode_start:decode_start + num_decode]
+                            if context.block_tables is not None else None
+                        )
+
+                        # flash-attn 要求 block_table 形状为 (batch_size, max_num_blocks_per_seq)
+                        if decode_block_tables is not None and decode_block_tables.ndim == 1:
+                            decode_block_tables = decode_block_tables.unsqueeze(0)
+
+                        o_decode = flash_attn_with_kvcache(
+                            q_decode.unsqueeze(1),  # (num_decode, 1, num_heads, head_dim)
+                            k_cache,
+                            v_cache,
+                            cache_seqlens=decode_context_lens,
+                            block_table=decode_block_tables,
+                            softmax_scale=self.scale,
+                            causal=True
+                        ).squeeze(1)
+                    else:
+                        o_decode = q_decode
 
                     # 合并结果
                     o = torch.cat([o_prefill, o_decode], dim=0)

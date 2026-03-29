@@ -330,42 +330,42 @@ class ModelRunner:
         logits = self.run_model(input_ids, positions, is_prefill)
 
         # 混合批次（prefill + decode）：保留刚好完成 prefill 以及纯 decode 的序列的 logits
-#         if is_prefill:
-#             CHUNK_SIZE = self.chunk_size
-#             keep_indices = []
-#             for i, seq in enumerate(seqs):
-#                 prompt_remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_len
-#                 # 只有不仅是prefill而且还没完成的请求才丢弃 logit
-#                 if prompt_remaining <= CHUNK_SIZE:
-#                     keep_indices.append(i)
-                    
-#             if len(keep_indices) < len(seqs):
-#                 keep_indices_tensor = torch.tensor(keep_indices, dtype=torch.long, device=logits.device)
-#                 logits = logits[keep_indices_tensor]
         if is_prefill:
             CHUNK_SIZE = self.chunk_size
             keep_indices = []
-            current_offset = 0
             for i, seq in enumerate(seqs):
                 prompt_remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_len
-                if prompt_remaining > 0:
-                    seqlen_q = min(CHUNK_SIZE, prompt_remaining)
-                else:
-                    seqlen_q = 1
-                
-                # 当前序列在 flat logits 张量中的最后一个 token 的索引
-                last_token_idx = current_offset + seqlen_q - 1
-                current_offset += seqlen_q
-
                 # 只有不仅是prefill而且还没完成的请求才丢弃 logit
                 if prompt_remaining <= CHUNK_SIZE:
-                    keep_indices.append(last_token_idx)
+                    keep_indices.append(i)
                     
-            if keep_indices:
+            if len(keep_indices) < len(seqs):
                 keep_indices_tensor = torch.tensor(keep_indices, dtype=torch.long, device=logits.device)
                 logits = logits[keep_indices_tensor]
-            else:
-                logits = logits[0:0]
+        # if is_prefill:
+        #     CHUNK_SIZE = self.chunk_size
+        #     keep_indices = []
+        #     current_offset = 0
+        #     for i, seq in enumerate(seqs):
+        #         prompt_remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_len
+        #         if prompt_remaining > 0:
+        #             seqlen_q = min(CHUNK_SIZE, prompt_remaining)
+        #         else:
+        #             seqlen_q = 1
+                
+        #         # 当前序列在 flat logits 张量中的最后一个 token 的索引
+        #         last_token_idx = current_offset + seqlen_q - 1
+        #         current_offset += seqlen_q
+
+        #         # 只有不仅是prefill而且还没完成的请求才丢弃 logit
+        #         if prompt_remaining <= CHUNK_SIZE:
+        #             keep_indices.append(last_token_idx)
+                    
+        #     if keep_indices:
+        #         keep_indices_tensor = torch.tensor(keep_indices, dtype=torch.long, device=logits.device)
+        #         logits = logits[keep_indices_tensor]
+        #     else:
+        #         logits = logits[0:0]
 
         # 根据实际生成的 logits 数量来准备 temperature
         num_logits = logits.size(0) if self.rank == 0 else None

@@ -163,7 +163,7 @@ class ModelRunner:
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [
-            seq.block_table + [0] * (max_len - len(seq.block_table)) for seq in seqs
+            seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs
             # 这里改成了填0️⃣
         ]
         block_tables = torch.tensor(
@@ -178,7 +178,7 @@ class ModelRunner:
         context_lens = []
         for seq in seqs:
             input_ids.append(seq.last_token)
-            positions.append(len(seq))
+            positions.append(len(seq)-1)
             context_lens.append(len(seq))
             slot_mapping.append(
                 seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
@@ -268,7 +268,9 @@ class ModelRunner:
                     v.zero_()
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
+            graph_vars["slot_mapping"].fill_(-1)
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
+            graph_vars["context_lens"].zero_()
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][
                 :bs, : context.block_tables.size(1)
@@ -330,42 +332,42 @@ class ModelRunner:
         logits = self.run_model(input_ids, positions, is_prefill)
 
         # 混合批次（prefill + decode）：保留刚好完成 prefill 以及纯 decode 的序列的 logits
-#         if is_prefill:
-#             CHUNK_SIZE = self.chunk_size
-#             keep_indices = []
-#             for i, seq in enumerate(seqs):
-#                 prompt_remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_len
-#                 # 只有不仅是prefill而且还没完成的请求才丢弃 logit
-#                 if prompt_remaining <= CHUNK_SIZE:
-#                     keep_indices.append(i)
-                    
-#             if len(keep_indices) < len(seqs):
-#                 keep_indices_tensor = torch.tensor(keep_indices, dtype=torch.long, device=logits.device)
-#                 logits = logits[keep_indices_tensor]
         if is_prefill:
             CHUNK_SIZE = self.chunk_size
             keep_indices = []
-            current_offset = 0
             for i, seq in enumerate(seqs):
                 prompt_remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_len
-                if prompt_remaining > 0:
-                    seqlen_q = min(CHUNK_SIZE, prompt_remaining)
-                else:
-                    seqlen_q = 1
-                
-                # 当前序列在 flat logits 张量中的最后一个 token 的索引
-                last_token_idx = current_offset + seqlen_q - 1
-                current_offset += seqlen_q
-
                 # 只有不仅是prefill而且还没完成的请求才丢弃 logit
                 if prompt_remaining <= CHUNK_SIZE:
-                    keep_indices.append(last_token_idx)
+                    keep_indices.append(i)
                     
-            if keep_indices:
+            if len(keep_indices) < len(seqs):
                 keep_indices_tensor = torch.tensor(keep_indices, dtype=torch.long, device=logits.device)
                 logits = logits[keep_indices_tensor]
-            else:
-                logits = logits[0:0]
+        # if is_prefill:
+        #     CHUNK_SIZE = self.chunk_size
+        #     keep_indices = []
+        #     current_offset = 0
+        #     for i, seq in enumerate(seqs):
+        #         prompt_remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_len
+        #         if prompt_remaining > 0:
+        #             seqlen_q = min(CHUNK_SIZE, prompt_remaining)
+        #         else:
+        #             seqlen_q = 1
+                
+        #         # 当前序列在 flat logits 张量中的最后一个 token 的索引
+        #         last_token_idx = current_offset + seqlen_q - 1
+        #         current_offset += seqlen_q
+
+        #         # 只有不仅是prefill而且还没完成的请求才丢弃 logit
+        #         if prompt_remaining <= CHUNK_SIZE:
+        #             keep_indices.append(last_token_idx)
+                    
+        #     if keep_indices:
+        #         keep_indices_tensor = torch.tensor(keep_indices, dtype=torch.long, device=logits.device)
+        #         logits = logits[keep_indices_tensor]
+        #     else:
+        #         logits = logits[0:0]
 
         # 根据实际生成的 logits 数量来准备 temperature
         num_logits = logits.size(0) if self.rank == 0 else None
@@ -427,6 +429,56 @@ class ModelRunner:
         '''
         支持混合批次：分别处理 prefill 和 decode 序列
         '''
+        if self.chunk_size >= 999999:
+            input_ids = []
+            positions = []
+            cu_seqlens_q = [0]
+            cu_seqlens_k = [0]
+            max_seqlen_q = 0
+            max_seqlen_k = 0
+            slot_mapping = []
+            block_tables = None
+            for seq in seqs:
+                seqlen = len(seq)
+                input_ids.extend(seq[seq.num_cached_tokens:])
+                positions.extend(list(range(seq.num_cached_tokens, seqlen)))
+                seqlen_q = seqlen - seq.num_cached_tokens
+                seqlen_k = seqlen
+                cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
+                cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
+                max_seqlen_q = max(seqlen_q, max_seqlen_q)
+                max_seqlen_k = max(seqlen_k, max_seqlen_k)
+                if not seq.block_table:
+                    continue
+                for i in range(seq.num_cached_blocks, seq.num_blocks):
+                    start = seq.block_table[i] * self.block_size
+                    if i != seq.num_blocks - 1:
+                        end = start + self.block_size
+                    else:
+                        end = start + seq.last_block_num_tokens
+                    slot_mapping.extend(list(range(start, end)))
+            if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
+                block_tables = self.prepare_block_tables(seqs)
+
+            input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+            cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            set_context(
+                True,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                slot_mapping,
+                None,
+                block_tables,
+                num_prefill_tokens=cu_seqlens_q[-1].item(),
+                num_decode_tokens=0,
+            )
+            return input_ids, positions
+
         # CHUNK_SIZE = 512  # 每次prefill处理的chunk大小
         CHUNK_SIZE = self.chunk_size
         # 记录混合批次信息

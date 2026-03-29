@@ -91,7 +91,7 @@ def main(args):
     llm = LLM(
         args.model_path, 
         max_model_len=args.max_model_len, 
-        # chunk_prefill_size=args.chunk_size
+        # chunk_prefill_size=512
     )
     
     # 3. 设置采样参数
@@ -160,10 +160,10 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, 
-                       default="/mnt/workspace/nano_vllm/nano-vllm/Qwen/Qwen3-0.6B",
+                       default="/root/autodl-tmp/Qwen/Qwen3-0.6B",
                        help="Path to model")
     # 想快速看前 10 个用这行: python eval_gsm8k.py --limit 10
-    parser.add_argument("--limit", type=int, default=10, help="测试样本数，-1为全部")
+    parser.add_argument("--limit", type=int, default=-1, help="测试样本数，-1为全部")
     # 对于带有长思考链的模型，需要较大的上下文支持（这里默认为2048以囊括提问+作答）
     parser.add_argument("--max_model_len", type=int, default=2048)
     # 为推理留出足够的空间

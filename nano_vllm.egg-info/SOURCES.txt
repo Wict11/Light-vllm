@@ -10,6 +10,8 @@ nanovllm/__init__.py
 nanovllm/config.py
 nanovllm/llm.py
 nanovllm/sampling_params.py
+nanovllm/engine/async_model_runner.py
+nanovllm/engine/async_scheduler.py
 nanovllm/engine/block_manager.py
 nanovllm/engine/llm_engine.py
 nanovllm/engine/model_runner.py

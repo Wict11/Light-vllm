@@ -28,8 +28,47 @@ class Scheduler:
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
         self.block_manager.deallocate(seq)
-        seq.prefilled_len = 0 # 更新prefilled_len
+        if self.chunk_size < 999999:
+            seq.prefilled_len = 0
         self.waiting.appendleft(seq)
+
+    def _schedule_base(self) -> tuple[list[Sequence], bool, int, int]:
+        scheduled_seqs = []
+        num_seqs = 0
+        num_batched_tokens = 0
+        while self.waiting and num_seqs < self.max_num_seqs:
+            seq = self.waiting[0]
+            prefill_tokens = len(seq) - seq.num_cached_tokens
+            if (
+                num_batched_tokens + prefill_tokens > self.max_num_batched_tokens
+                or not self.block_manager.can_allocate(seq)
+            ):
+                break
+            num_seqs += 1
+            self.block_manager.allocate(seq)
+            num_batched_tokens += prefill_tokens
+            seq.status = SequenceStatus.RUNNING
+            self.waiting.popleft()
+            self.running.append(seq)
+            scheduled_seqs.append(seq)
+        if scheduled_seqs:
+            return scheduled_seqs, True, num_batched_tokens, 0
+
+        while self.running and num_seqs < self.max_num_seqs:
+            seq = self.running.popleft()
+            while not self.block_manager.can_append(seq):
+                if self.running:
+                    self.preempt(self.running.pop())
+                else:
+                    self.preempt(seq)
+                    break
+            else:
+                num_seqs += 1
+                self.block_manager.may_append(seq)
+                scheduled_seqs.append(seq)
+        assert scheduled_seqs
+        self.running.extendleft(reversed(scheduled_seqs))
+        return scheduled_seqs, False, 0, len(scheduled_seqs)
                 
 #     def schedule(self) -> tuple[list[Sequence], bool]:
 #         # prefill
@@ -233,6 +272,9 @@ class Scheduler:
                 and num_prefills < self.max_num_prefills)
 
     def schedule(self) -> tuple[list[Sequence], bool, int, int]:
+        if self.chunk_size >= 999999:
+            return self._schedule_base()
+
         CHUNK_SIZE = self.chunk_size
         scheduled_seqs = []       # 本轮被调度的序列（prefill 在前，decode 在后）
         prefill_scheduled = []    # 被调度的 prefill 序列（用于从 running 中临时移除）
@@ -397,6 +439,15 @@ class Scheduler:
 #                     self.block_manager.deallocate(seq)
 #                     self.running.remove(seq)
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill:bool=False) -> list[bool]:
+        if self.chunk_size >= 999999:
+            for seq, token_id in zip(seqs, token_ids):
+                seq.append_token(token_id)
+                if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+                    seq.status = SequenceStatus.FINISHED
+                    self.block_manager.deallocate(seq)
+                    self.running.remove(seq)
+            return
+
         '''
         处理模型输出：
         - 纯 prefill 序列：只更新 prefilled_len，不 append token
