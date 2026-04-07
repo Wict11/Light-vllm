@@ -91,7 +91,7 @@ def main(args):
     llm = LLM(
         args.model_path, 
         max_model_len=args.max_model_len, 
-        # chunk_prefill_size=512
+        chunk_prefill_size=512
     )
     
     # 3. 设置采样参数

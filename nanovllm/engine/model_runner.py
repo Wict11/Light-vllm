@@ -204,6 +204,9 @@ class ModelRunner:
         )
         return input_ids, positions
 
+    def _prefill_remaining(self, seq: Sequence) -> int:
+        return seq.prefill_target_len - seq.num_cached_tokens - seq.prefilled_len
+
     # def prepare_sample(self, seqs: list[Sequence], is_prefill: bool = False, num_logits: int = None):
     #     '''
     #     为采样准备 temperature 张量。
@@ -236,7 +239,7 @@ class ModelRunner:
         if is_prefill:
             # 混合批次：跳过还需要继续 prefill 的序列，只收集本轮产出 token 的序列
             for seq in seqs:
-                prompt_remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_len
+                prompt_remaining = self._prefill_remaining(seq)
                 if prompt_remaining <= CHUNK_SIZE:
                     temperatures.append(seq.temperature)
         else:
@@ -336,11 +339,11 @@ class ModelRunner:
             CHUNK_SIZE = self.chunk_size
             keep_indices = []
             for i, seq in enumerate(seqs):
-                prompt_remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_len
+                prompt_remaining = self._prefill_remaining(seq)
                 # 只有不仅是prefill而且还没完成的请求才丢弃 logit
                 if prompt_remaining <= CHUNK_SIZE:
                     keep_indices.append(i)
-                    
+
             if len(keep_indices) < len(seqs):
                 keep_indices_tensor = torch.tensor(keep_indices, dtype=torch.long, device=logits.device)
                 logits = logits[keep_indices_tensor]
@@ -500,7 +503,7 @@ class ModelRunner:
             # seqlen_k = end_pos # k序列长度只包含已经prefill的token
             # remaining_prefill = seqlen - seq.num_cached_tokens - seq.prefilled_len
             # 计算剩余需要 prefill 的长度（基于 prompt，不包括已生成的 token）
-            prompt_remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_len
+            prompt_remaining = self._prefill_remaining(seq)
 
 
             if prompt_remaining > 0: # 避免warmup时，多个序列进行prefill

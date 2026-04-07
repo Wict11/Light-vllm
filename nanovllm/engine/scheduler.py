@@ -27,10 +27,18 @@ class Scheduler:
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
+        seq.mark_preempted()
         self.block_manager.deallocate(seq)
         if self.chunk_size < 999999:
             seq.prefilled_len = 0
         self.waiting.appendleft(seq)
+
+    def _prefill_remaining(self, seq: Sequence) -> int:
+        return seq.prefill_target_len - seq.num_cached_tokens - seq.prefilled_len
+
+    def _clear_preempted_if_prefill_done(self, seq: Sequence):
+        if seq.is_preempted and self._prefill_remaining(seq) <= 0:
+            seq.clear_preempted()
 
     def _schedule_base(self) -> tuple[list[Sequence], bool, int, int]:
         scheduled_seqs = []
@@ -288,8 +296,9 @@ class Scheduler:
         for seq in list(self.running):
             if not self._budget_can_add_prefill(num_seqs, num_batched_tokens, num_prefills, 1):
                 break  # 预算或 prefill 数量已满，停止
-            prompt_remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_len
+            prompt_remaining = self._prefill_remaining(seq)
             if prompt_remaining <= 0:
+                self._clear_preempted_if_prefill_done(seq)
                 continue  # 已经 prefill 完成，跳过
             this_chunk_size = min(prompt_remaining, CHUNK_SIZE)
             if not self._budget_can_add_prefill(num_seqs, num_batched_tokens, num_prefills, this_chunk_size):
@@ -310,13 +319,14 @@ class Scheduler:
         # 在 prefill 数量/token预算/序列数量还有余量时，持续从 waiting 取新序列
         while self.waiting and self._budget_can_add_prefill(num_seqs, num_batched_tokens, num_prefills, 1):
             seq = self.waiting[0]
-            prompt_remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_len
+            prompt_remaining = self._prefill_remaining(seq)
             this_chunk_size = min(prompt_remaining, CHUNK_SIZE)
 
             # 如果 prompt 已经完全 prefill 完成，直接转入 running 等待 decode
             if prompt_remaining <= 0:
                 self.waiting.popleft()
                 seq.status = SequenceStatus.RUNNING
+                self._clear_preempted_if_prefill_done(seq)
                 self.running.appendleft(seq)
                 continue
 
@@ -356,10 +366,11 @@ class Scheduler:
                     if seq in scheduled_seqs:
                         continue
                     # 跳过还没完成 prefill 的序列（不应在 decode 阶段处理）
-                    prompt_remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_len
+                    prompt_remaining = self._prefill_remaining(seq)
                     if prompt_remaining > 0:
                         self.running.appendleft(seq)
                         continue
+                    self._clear_preempted_if_prefill_done(seq)
                     # 检查 token 预算（decode 每个序列消耗 1 个 token）
                     if num_batched_tokens + 1 <= self.max_num_batched_tokens:
                         # if not has_prefill:
@@ -386,11 +397,12 @@ class Scheduler:
         num_prefill_tokens = 0
         num_decode_tokens = 0
         for seq in scheduled_seqs:
-            prompt_remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_len
+            prompt_remaining = self._prefill_remaining(seq)
             if prompt_remaining > 0:
                 chunk_size = min(prompt_remaining, CHUNK_SIZE)
                 num_prefill_tokens += chunk_size
             else:
+                self._clear_preempted_if_prefill_done(seq)
                 num_decode_tokens += 1
         # print(f"seqs_len: {len(scheduled_seqs)}, is_prefill: {has_prefill}, num_prefill_tokens: {num_prefill_tokens}, num_decode_tokens: {num_decode_tokens}")
         return scheduled_seqs, has_prefill, num_prefill_tokens, num_decode_tokens
@@ -461,15 +473,17 @@ class Scheduler:
             
             # 首先遍历所有序列，处理 prefill 进度
             for seq in seqs:
-                prompt_remaining = seq.num_prompt_tokens - seq.num_cached_tokens - seq.prefilled_len
+                prompt_remaining = self._prefill_remaining(seq)
                 if prompt_remaining > 0:
                     prefill_chunk_size = min(prompt_remaining, CHUNK_SIZE)
                     seq.prefilled_len += prefill_chunk_size
                     # 如果 prefill 刚好完成，它本轮就会输出一个 token，加入 decode_seqs
                     if prompt_remaining <= CHUNK_SIZE:
+                        self._clear_preempted_if_prefill_done(seq)
                         decode_seqs.append(seq)
                 else:
                     # 已经是纯 decode 状态的序列
+                    self._clear_preempted_if_prefill_done(seq)
                     decode_seqs.append(seq)
 
             # 处理接收 token 的序列（token_ids 对应 decode_seqs 中的序列）

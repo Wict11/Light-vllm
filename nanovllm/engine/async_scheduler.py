@@ -52,6 +52,15 @@ class AsyncScheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 
+    def _prefill_remaining(self, seq: Sequence, effective_prefilled: int | None = None) -> int:
+        if effective_prefilled is None:
+            effective_prefilled = self._get_effective_prefilled_len(seq)
+        return seq.prefill_target_len - seq.num_cached_tokens - effective_prefilled
+
+    def _clear_preempted_if_prefill_done(self, seq: Sequence, effective_prefilled: int | None = None):
+        if seq.is_preempted and self._prefill_remaining(seq, effective_prefilled) <= 0:
+            seq.clear_preempted()
+
     def schedule(self) -> tuple[list[Sequence], bool, int, int]:
         """
         调度下一个批次
@@ -83,9 +92,10 @@ class AsyncScheduler:
             
             # 关键：使用 effective_prefilled_len（包括 pending）
             effective_prefilled = self._get_effective_prefilled_len(seq)
-            prompt_remaining = seq.num_prompt_tokens - seq.num_cached_tokens - effective_prefilled
+            prompt_remaining = self._prefill_remaining(seq, effective_prefilled)
             
             if prompt_remaining <= 0:
+                self._clear_preempted_if_prefill_done(seq, effective_prefilled)
                 continue  # 已经 prefill 完成
             
             this_chunk_size = min(prompt_remaining, CHUNK_SIZE)
@@ -114,7 +124,7 @@ class AsyncScheduler:
             
             # 使用 effective_prefilled_len
             effective_prefilled = self._get_effective_prefilled_len(seq)
-            prompt_remaining = seq.num_prompt_tokens - seq.num_cached_tokens - effective_prefilled
+            prompt_remaining = self._prefill_remaining(seq, effective_prefilled)
             this_chunk_size = min(prompt_remaining, CHUNK_SIZE)
             
             if this_chunk_size > 0 and \
@@ -157,11 +167,12 @@ class AsyncScheduler:
                 
                 # 检查是否完成 prefill
                 effective_prefilled = self._get_effective_prefilled_len(seq)
-                prompt_remaining = seq.num_prompt_tokens - seq.num_cached_tokens - effective_prefilled
+                prompt_remaining = self._prefill_remaining(seq, effective_prefilled)
                 
                 if prompt_remaining > 0:
                     self.running.appendleft(seq)
                     continue
+                self._clear_preempted_if_prefill_done(seq, effective_prefilled)
                 
                 # 若“已生成 + 占位”已达到最大输出长度，不再继续调度该序列。
                 # 等待后处理拿到真实 token 后，按既有逻辑进入 finished。
@@ -295,6 +306,7 @@ class AsyncScheduler:
             for prefill_seq in prefill_seqs:
                 chunk_size = chunk_info[prefill_seq.seq_id]
                 prefill_seq.prefilled_len += chunk_size
+                self._clear_preempted_if_prefill_done(prefill_seq)
 
             # 2. 需要写入真实 token 的序列：
             #   1) 原本 decode 序列
@@ -302,7 +314,7 @@ class AsyncScheduler:
             token_target_seqs: list[Sequence] = []
             token_target_seqs.extend(decode_seqs)
             for prefill_seq in prefill_seqs:
-                remain = prefill_seq.num_prompt_tokens - prefill_seq.num_cached_tokens - prefill_seq.prefilled_len
+                remain = self._prefill_remaining(prefill_seq)
                 if remain <= 0:
                     token_target_seqs.append(prefill_seq)
 
@@ -345,7 +357,10 @@ class AsyncScheduler:
     def preempt(self, seq: Sequence):
         """抢占序列"""
         seq.status = SequenceStatus.WAITING
+        seq.mark_preempted()
         self.block_manager.deallocate(seq)
+        if self.chunk_size < 999999:
+            seq.prefilled_len = 0
         self.waiting.appendleft(seq)
 
     def abort_request(self, request_id: str):

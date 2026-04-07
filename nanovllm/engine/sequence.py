@@ -28,6 +28,8 @@ class Sequence:
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
         self.prefilled_len = 0
+        self.is_preempted = False
+        self.preempted_total_len = 0
         self.aborted = False  # 标记序列是否被取消（用于异步调度）
         self.num_ph_tokens = 0
 
@@ -73,6 +75,20 @@ class Sequence:
         self.token_ids.append(token_id)
         self.last_token = token_id
         self.num_tokens += 1
+
+    @property
+    def prefill_target_len(self):
+        if self.is_preempted and self.preempted_total_len > 0:
+            return self.preempted_total_len
+        return self.num_prompt_tokens
+
+    def mark_preempted(self):
+        self.is_preempted = True
+        self.preempted_total_len = self.num_tokens
+
+    def clear_preempted(self):
+        self.is_preempted = False
+        self.preempted_total_len = 0
 
     def __getstate__(self):
         return (
